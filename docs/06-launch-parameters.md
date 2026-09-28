@@ -1,146 +1,27 @@
-# 06 · 关键参数与取值依据（第一方配方，2026-09-14）
+# 06 · 参数与依据
 
-**这篇讲什么**：`scripts/v41-tuned-tp4.sh` 里每个关键参数的取值与依据。环境变量可在起服前覆盖（见脚本头部）。
+**接线原则**：argv 里有 ≠ 代码读了 ≠ 当前配置会执行。下面只写本部署验证过的。
 
----
-
-## 1. 参数总表
-
-| 参数 / 环境变量 | 默认值 | 依据 |
+| 键 / 参数 | 本机值 | 依据 |
 |---|---|---|
-| `IMAGE` | `aidendle94/sparkrun-vllm-dsv41-gb10:production-1.0` | 四台 `RootFS.Layers` 48 行逐字相同（A） |
-| `MODEL` | `/home/cq/models/DeepSeek-V4.1-Flash` | 四台各 48/48 本地分片 |
-| `PATCH_DIR` | `/home/cq/v41patch` | 七个补丁 + `mounts.txt` |
-| `PORT` | `8001` | 避开 `:8000` 常用占用 |
-| `MASTER_PORT` | `25410` | rendezvous（joe 组法） |
-| `TP` | `4` | 四节点 |
-| `CTX` | **720896** | 614400 + 102400 + 4096 |
-| `GPU_UTIL` | **0.80** | profiling 路径取 KV（**无 KVB**） |
-| `MAXSEQS` | **8** | joe 1M 窗对照 |
-| `MAXBATCH` | **8192** | joe 实测 16K 使 KV 掉 35.8% 且无 prefill 收益 |
-| `BLOCK_SIZE` | **128** | Tony recipe |
-| `DSPARK` | **5** | Tony boot10 / recipe |
-| `MOE_BACKEND` | **b12x** | joe 对照表 KV 池最大腿 |
-| `B12X_A16` | **1** | `VLLM_B12X_MOE_FP4_FORCE_A16=1` |
-| `VISION` | `1` | 开多模态 |
-| `IMAGES_PER_PROMPT` | **20** | 2026-09-14 晚重起实测 |
-| `DSV41_ENGRAM_DISK` | **1** | **必须**；否则每 rank 118.81 GiB |
-| CUDA graphs | `FULL_AND_PIECEWISE` | Tony recipe |
-| `--engram-config` | `{"cpu_offload": false}` | 行在 NVMe，不 CPU offload |
-| parsers | `deepseek_v41` | vLLM recipe |
+| `CONTEXT_LENGTH` | 600000 | SGLang `--context-length` 是**总长**。客户端 500k+100k 必须写成 600k，写成 500k 会在长输出截断。 |
+| `DSV41_MAX_NEW_TOKENS` | 100000 | 须进入容器（`start.sh` 的 `-e` 名单或 `EXTRA_CONTAINER_ENV`）。只写在 `.env` 而未进容器则无效。日志应有 `caps at 100000`。 |
+| `MAX_RUNNING_REQUESTS` | 4 | 与 CUDA graph decode bs 对齐。本机从 6 改 4，减轻长 prefill 互抢。 |
+| `MAX_TOTAL_TOKENS` | 2500000 | 给内存留余量。0.80 静态预算可能把池压到约 2.15M（随起服时空闲变）。钉值高于比例上限时，日志 `max_total_num_tokens` 以比例为准。 |
+| `MEM_FRACTION_STATIC` | 0.80 | 上游默认。当 KV 已被钉在比例之下时，再拧这个数**不改变**已钉池（09-28 实测 0.90→0.85 只差池缩小那一截）。 |
+| `CHUNKED_PREFILL_SIZE` | 4096 | 上游 TP4 默认。不要抄 Mia TP3 的 768。 |
+| `DSV41_CACHE_GIB` | 4 | 上游默认。 |
+| `--image-processor-backend pil` | 开 | 09-26 / 09-29：不加则 worker 卡 `cargo --version --verbose` 5–9 分钟。 |
+| `--prefill-decode-interval 1` | 开 | 每块 prefill 后插 1 步 decode。消费点在 SGLang 调度器；本配置会执行。 |
+| `DSV41_FAST_LOAD_*` | 1 GB / 2 线程 | 只作用于加载，防装权把统一内存推顶。 |
+| `SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0` | 开 | 只关一项启动检查。 |
+| v2.2 开关 | 模板原样 | `L2_PREFETCH_WOA` / `SPEC_SYNC_FREE=all` / `EAGER_GLUE=all` / `SPLIT_COMPACT_GATHER=1`。日志应有 `[spec_sync_free] armed`、`RoCEnante ready: world=4`、DSpark `gamma=5`。 |
 
-**刻意不设**：`--kv-cache-memory-bytes`、`--default-chat-template-kwargs`（thinking 走 recipe 默认 ON）。
+## 明确不要抄回的旧数
 
----
+`MAX_TOTAL_TOKENS=3500000` / 并发 5 或 6 / 窗 1048576 / 988576 / 4250000 / `MEM_FRACTION_STATIC=0.85` 当「还能再挤」——那些是另一套实验，09-28 已证明 KV 用过不还。
 
-## 2. `--max-model-len = 720896`
+## 容量（C）
 
-```
-614400  (600K prompt)
-+ 102400 (100K output)
-+   4096 (余量)
-= 720896
-```
-
-客户端 `contextWindow` 可对齐 614400；引擎窗必须含输出预算。
-
----
-
-## 3. 容量：profiling 路径（本配方无 KVB）
-
-本部署**不设** `--kv-cache-memory-bytes` ⇒ vLLM 走 **memory profiling**，GMU 0.80 参与 KV 分配。
-
-本 boot 实测（A，`docker logs` + `GET /v1/models`）：
-
-| 项 | 值 |
-|---|---|
-| GPU KV | **2,552,135 tokens** |
-| KV 体积 | **13.79 GiB** |
-| 满窗倍数 | **3.54×** |
-| 起服 GMU 闸 | 需 ≥ 97.35 GiB；快照 98.21 / 121.69 GiB |
-
-⚠️ 若你曾用 KVB 档（如 5.9e9 → 1,722,343 tokens），**不可与本次跨 boot 直比**。
-
-`--max-num-batched-tokens` 保持 **8192**：joe 记录 16K chunk 使 KV 掉 35.8%。
-
----
-
-## 4. Engram-on-disk（决定性）
-
-| 状态 | 每 rank 权重驻留（C） | 能否起服 |
-|---|---|---|
-| 无补丁 | 475.25 ÷ 4 = **118.81 GiB** | ❌ > ~114 GiB 可用 |
-| 有补丁 | 日志约 **81.4 GiB** 级 + 盘上 23.6 GiB×2 不分配 | ✅ |
-
-日志关键字（A）：
-
-```
-Engram table DISK-backed: ... 23.60 GiB not allocated
-```
-
----
-
-## 5. MoE：`b12x` + `FORCE_A16`
-
-joe `dsv41/README.md` MoE 后端对照：本配置选 **b12x bf16 腿**（`VLLM_B12X_MOE_FP4_FORCE_A16=1`）以最大化 KV 池。
-
----
-
-## 6. DSpark k=5
-
-```json
-{
-  "method": "dspark",
-  "num_speculative_tokens": 5,
-  "enable_adaptive_verification": false
-}
-```
-
-与 Tony boot10 / vLLM recipe 一致。CUDA graph capture sizes 由 `DSPARK` 与 `MAXSEQS` 自动生成。
-
----
-
-## 7. 视觉 `image:20`
-
-```bash
---limit-mm-per-prompt '{"image":20}' --mm-processor-cache-gb 1
-```
-
-2026-09-14 同会话五轮视觉压测 5/5（A）。此前 `image:4` 时第 5 轮会 400。
-
----
-
-## 8. 思考模式
-
-**不设** `--default-chat-template-kwargs`。vLLM recipe 默认 **thinking ON、effort 50**。
-
-客户端可用 `chat_template_kwargs.thinking=false` 或 `reasoning_effort` 控每请求行为。
-
----
-
-## 9. NCCL 与节点映射
-
-脚本内 `NODE_ROCE`（rank 0..3）：
-
-```
-10.100.24.4  # spark-01
-10.100.24.3  # spark-02
-10.100.24.1  # spark-03
-10.100.24.2  # spark-04
-```
-
-⚠️ **02 与 03 的 RoCE 尾号与节点号相反。**
-
-`--distributed-executor-backend mp`，worker 3→2→1 先起，head 0 最后。
-
----
-
-## 10. 环境变量速查
-
-```bash
-# 只看命令，不起服
-DRYRUN=1 CTX=720896 PATCH_DIR=/home/cq/v41patch bash scripts/v41-tuned-tp4.sh
-
-# 改窗（需重新 profiling，跨 boot 数字不可直比）
-CTX=720896 GPU_UTIL=0.80 bash scripts/v41-tuned-tp4.sh
-```
+`2502144 × 1670.75 B ≈ 4.18×10⁹ B ≈ 4.18 GB/台` 满池写入。  
+knapcio 默认 8000000 ≈ 13.4 GB/台（同一字节/token 假设）。
