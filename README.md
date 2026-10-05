@@ -12,7 +12,7 @@
 
 | 项 | 值 |
 |---|---|
-| 入口 | `http://<head-mgmt>:8001/v1`（本机 head 管理口曾为 `192.168.1.4`；脚本只用 RoCE `HEAD_IP`） |
+| 入口 | `http://<head-mgmt>:8001/v1`（脚本只用 RoCE `HEAD_IP`） |
 | 模型名 | `deepseek-v4.1-flash` |
 | 上游代码 | knapcio `e9ec61d2`（v2.2，2026-09-25） |
 | 基础镜像 | `lmsysorg/sglang:dev-dsv41`（本机构建未再拉；记录 digest `381b27ff`） |
